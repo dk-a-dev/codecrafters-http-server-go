@@ -6,8 +6,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"path"
-	"strings"
 )
 
 func main() {
