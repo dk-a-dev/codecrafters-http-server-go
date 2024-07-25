@@ -1,45 +1,144 @@
 package main
-
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"net"
-	"net/http"
 	"os"
+	"strconv"
+	"strings"
 )
+var statusCodeToString = map[int]string{
+	200: "OK",
+	404: "Not Found",
+}
+type Request struct {
+	Method  string
+	Path    string
+	Headers map[string]string
+	Body    string
+}
+type Response struct {
+	StatusCode int
+	Headers    map[string]string
+	Body       string
+}
+
+func (r Response) String() string {
+	statusText, ok := statusCodeToString[r.StatusCode]
+	if !ok {
+		statusText = "Unknown"
+	}
+	
+	if r.Headers == nil {
+		r.Headers = map[string]string{
+			"Content-Type": "text/plain",
+		}
+	}
+
+	if _, ok = r.Headers["Content-Length"]; !ok {
+		r.Headers["Content-Length"] = strconv.Itoa(len(r.Body))
+	}
+
+	var headerString strings.Builder
+	for k, v := range r.Headers {
+		headerString.WriteString(fmt.Sprintf("%s: %s\r\n", k, v))
+	}
+
+	return fmt.Sprintf("HTTP/1.1 %d %s\r\n%s\r\n%s", r.StatusCode, statusText, headerString.String(), r.Body)
+}
 
 func main() {
-	fmt.Println("Logs from your program will appear here!")
-
-	l, err := net.Listen("tcp", "0.0.0.0:4221")
+	l, err := net.Listen("tcp", ":4221")
 	if err != nil {
 		fmt.Println("Failed to bind to port 4221")
 		os.Exit(1)
 	}
+	for {
+		conn, err := l.Accept()
+		if err != nil {
+			fmt.Println("Error accepting connection: ", err.Error())
+			os.Exit(1)
+		}
+		
+		go handleConnection(conn)
+	}
+}
 
-	conn, err := l.Accept()
+func handleConnection(conn net.Conn) {
+	stream := bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
+	defer func(conn net.Conn) {
+		err := conn.Close()
+		if err != nil {
+			fmt.Println("Failed to close connection: ", err.Error())
+		}
+	}(conn)
+
+	request, err := parseRequest(stream.Reader)
 	if err != nil {
-		fmt.Println("Error accepting connection: ", err.Error())
+		fmt.Println("Failed to parse request: ", err.Error())
 		os.Exit(1)
 	}
-	defer conn.Close()
-	request, err := http.ReadRequest(bufio.NewReader(conn))
-	if err != nil {
-		fmt.Println("Error reading request. ", err.Error())
-		return
-	}
-	var res string
-	path :=request.URL.Path
 
-	if path == "/" {
-		res = "HTTP/1.1 200 OK\r\n\r\n"
-	} else if path == "/user-agent" {
-		res = fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n\r\n%s", len(request.UserAgent()), request.UserAgent())
-	} else if path[0:6] == "/echo/" {
-		echo := path[6:]
-		res = fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n\r\n%s", len(echo), echo)
-	} else {
-		res = "HTTP/1.1 404 Not Found\r\n\r\n"
+	response := Response{StatusCode: 200}
+	if strings.HasPrefix(request.Path, "/echo") {
+		pathParts := strings.SplitN(request.Path, "/echo/", 2)
+		response.Body = pathParts[1]
+	} else if request.Path == "/user-agent" {
+		userAgent := request.Headers["User-Agent"]
+		response.Body = userAgent
+	} else if request.Path != "/" {
+		response.StatusCode = 404
 	}
-	conn.Write([]byte(res))
+	_, err = stream.WriteString(response.String())
+	if err != nil {
+		fmt.Println("Failed to write to socket: ", err.Error())
+		os.Exit(1)
+	}
+
+	err = stream.Flush()
+	if err != nil {
+		fmt.Println("Failed to flush to socket")
+		os.Exit(1)
+	}
+}
+
+func parseRequest(reader *bufio.Reader) (Request, error) {
+	request := Request{
+		Headers: make(map[string]string),
+	}
+	firstLine, err := reader.ReadString('\n')
+	if err != nil {
+		return Request{}, fmt.Errorf("malformed HTTP request")
+	}
+	parts := strings.Split(firstLine, " ")
+	request.Method = parts[0]
+	request.Path = parts[1]
+	for {
+		curLine, err := reader.ReadString('\n')
+		if curLine == "\r\n" {
+			break
+		}
+		if err == io.EOF {
+			return request, nil
+		} else if err != nil {
+			return Request{}, err
+		}
+		headerParts := strings.SplitN(curLine, ":", 2)
+		request.Headers[headerParts[0]] = strings.TrimSpace(headerParts[1])
+	}
+
+	contentLenStr, ok := request.Headers["Content-Length"]
+	if !ok {
+		return request, nil
+	}
+	contentLen, _ := strconv.Atoi(contentLenStr)
+	buf := make([]byte, contentLen)
+
+	_, err = io.ReadFull(reader, buf)
+	if err != nil {
+		return request, err
+	}
+	request.Body = string(buf)
+	return request, nil
 }
